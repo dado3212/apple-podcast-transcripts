@@ -376,9 +376,14 @@
           }
         }
 
-        // Sort it by last modified
+        // Sort by episode air date (falling back to local cache mtime for
+        // entries with no DB match, since those have no ZFIRSTTIMEAVAILABLE)
         transcripts = Object.fromEntries(Object.entries(transcripts)
-          .sort(([, a], [, b]) => new Date(b.lastModified) - new Date(a.lastModified)));
+          .sort(([, a], [, b]) => {
+            const aTime = a.time > 0 ? a.time * 1000 : a.lastModified;
+            const bTime = b.time > 0 ? b.time * 1000 : b.lastModified;
+            return bTime - aTime;
+          }));
 
         // Iterate over it
         for (const transcript of Object.values(transcripts)) {
