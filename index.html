@@ -302,60 +302,82 @@
 
         if (db) {
           const keys = Object.keys(relevantFiles.transcripts);
-          // Some of the DBs don't have the `ZFIRSTTIMEAVAILABLE` column, so check if 
-          // it exists with pragma first.
-          const columns = new Set(db.exec('PRAGMA table_info(ZMTEPISODE);')[0].values.map(v => v[1]));
-          if (columns.has('ZFIRSTTIMEAVAILABLE')) {
-            const podcastInfo = db.exec(
-              `SELECT
-                ZSTORETRACKID,
-                ZAUTHOR,
-                ZCLEANEDTITLE,
-                ZITUNESSUBTITLE,
-                ZDURATION,
-                ZFIRSTTIMEAVAILABLE
-              FROM ZMTEPISODE
-              WHERE ZSTORETRACKID IN (
-                ${keys.join(', ')}
-              );
-            `);
-            // All transcripts
-            if (podcastInfo.length > 0) {
-              for (const pod of podcastInfo[0].values) {
-                transcripts[pod[0]] = {
-                  'author': pod[1],
-                  'title': pod[2],
-                  'description': pod[3],
-                  'duration': pod[4],
-                  'time': pod[5] + 978307200, // Adjust for Jan 1st time which Apple uses
-                };
-              }
-            }
+
+          // Apple has repeatedly reshuffled the ZMTEPISODE schema across macOS
+          // versions (columns renamed, or moved out to related tables entirely).
+          // Rather than hardcode one schema shape, detect what's actually there
+          // and build the query to match.
+          const getColumns = (table) => {
+            const res = db.exec(`PRAGMA table_info(${table});`);
+            return new Set(res.length > 0 ? res[0].values.map(v => v[1]) : []);
+          };
+
+          const episodeColumns = getColumns('ZMTEPISODE');
+          const hasFirstTimeAvailable = episodeColumns.has('ZFIRSTTIMEAVAILABLE');
+
+          // Title: ZCLEANEDTITLE was dropped in later macOS versions in favor
+          // of ZTITLE / ZITUNESTITLE.
+          const titleColumn = ['ZCLEANEDTITLE', 'ZTITLE', 'ZITUNESTITLE']
+            .find(c => episodeColumns.has(c));
+
+          // Subtitle: ZITUNESSUBTITLE was dropped; the text moved to the
+          // related ZMTEPISODEDESCRIPTION table. Use a scalar subquery (not
+          // a JOIN) since an episode can have more than one description row
+          // and a JOIN would fan out into duplicate result rows.
+          let subtitleExpr = `''`;
+          if (episodeColumns.has('ZITUNESSUBTITLE')) {
+            subtitleExpr = `COALESCE(e.ZITUNESSUBTITLE, '')`;
           } else {
-            const podcastInfo = db.exec(
-              `SELECT
-                ZSTORETRACKID,
-                ZAUTHOR,
-                ZCLEANEDTITLE,
-                ZITUNESSUBTITLE,
-                ZDURATION
-              FROM ZMTEPISODE
-              WHERE ZSTORETRACKID IN (
-                ${keys.join(', ')}
-              );
-            `);
-            console.log(podcastInfo);
-            // All transcripts
-            if (podcastInfo.length > 0) {
-              for (const pod of podcastInfo[0].values) {
-                transcripts[pod[0]] = {
-                  'author': pod[1],
-                  'title': pod[2],
-                  'description': pod[3],
-                  'duration': pod[4],
-                  'time': -1,
-                };
-              }
+            const descColumns = getColumns('ZMTEPISODEDESCRIPTION');
+            const descTextCol = ['ZPLAINTEXT', 'ZTEXT'].find(c => descColumns.has(c));
+            if (descTextCol) {
+              subtitleExpr = `COALESCE((SELECT d.${descTextCol} FROM ZMTEPISODEDESCRIPTION d WHERE d.ZEPISODE = e.Z_PK LIMIT 1), '')`;
+            }
+          }
+
+          // Duration: ZDURATION was dropped; it moved to the related
+          // ZMTMEDIAENCLOSURE table, which can have multiple rows per
+          // episode (e.g. re-downloads at different qualities) — same
+          // scalar-subquery reasoning as above, preferring the most
+          // recently downloaded row.
+          let durationExpr = '-1';
+          if (episodeColumns.has('ZDURATION')) {
+            durationExpr = `COALESCE(e.ZDURATION, -1)`;
+          } else {
+            const enclosureColumns = getColumns('ZMTMEDIAENCLOSURE');
+            if (enclosureColumns.has('ZDURATION')) {
+              const orderBy = enclosureColumns.has('ZDOWNLOADDATE') ? ' ORDER BY m.ZDOWNLOADDATE DESC' : '';
+              durationExpr = `COALESCE((SELECT m.ZDURATION FROM ZMTMEDIAENCLOSURE m WHERE m.ZEPISODE = e.Z_PK${orderBy} LIMIT 1), -1)`;
+            }
+          }
+
+          const selectCols = [
+            'e.ZSTORETRACKID',
+            'e.ZAUTHOR',
+            titleColumn ? `e.${titleColumn}` : `'Unknown'`,
+            subtitleExpr,
+            durationExpr,
+          ];
+          if (hasFirstTimeAvailable) selectCols.push('e.ZFIRSTTIMEAVAILABLE');
+
+          const podcastInfo = db.exec(
+            `SELECT
+              ${selectCols.join(',\n              ')}
+            FROM ZMTEPISODE e
+            WHERE e.ZSTORETRACKID IN (
+              ${keys.join(', ')}
+            );
+          `);
+          // All transcripts
+          if (podcastInfo.length > 0) {
+            for (const pod of podcastInfo[0].values) {
+              transcripts[pod[0]] = {
+                'author': pod[1],
+                'title': pod[2],
+                'description': pod[3],
+                'duration': pod[4],
+                'time': hasFirstTimeAvailable ? pod[5] + 978307200 : -1, // Adjust for Jan 1st time which Apple uses
+              };
             }
           }
         }
@@ -385,7 +407,7 @@
           const podcastDiv = document.createElement("div");
           podcastDiv.className = "podcast";
           let description = transcript.description;
-          if (description == '') {
+          if (!description) {
             description = transcript.transcripts.map(s => s.sentences).join("\n");
           }
           podcastDiv.innerHTML = `
