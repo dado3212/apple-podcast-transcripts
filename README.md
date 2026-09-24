@@ -25,6 +25,8 @@ Loading files doesn't work just by opening from `file://` in your browser, so in
 python3 -m http.server
 ```
 
+The "tests" folder also contains .zip files that should continue to work.
+
 ## How did you get WAL working with sql.js??
 
 Great question. This [issue was the key](https://github.com/sql-js/sql.js/issues/372). But the compiling steps were a nightmare, so I just manually modified the `sql-wasm.js` file. Will need to do this again with a version boost. Specifically you can look for the `dbfile_` bit in code, find the `if(null!=g)` code and copy it with a different variable (and the '-wal' suffix in the filename definition).
